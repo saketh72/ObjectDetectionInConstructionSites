@@ -1,0 +1,665 @@
+
+
+# # Detection of Relevant Object in Construction Site Pictures
+
+# In[306]:
+
+
+import json
+from PIL import Image as Imagem
+import boto3
+from pprint import pprint
+from sklearn.model_selection import train_test_split
+
+s3 = boto3.client("s3")
+bucket = "sagemaker72"
+reko_bucket= "customlabels72"
+input_path = "cl-demo/input"
+reko_manifest_path = "cl-demo"
+output_path = "cl-demo/output"
+
+
+# In[50]:
+
+k = 1
+comprehend = boto3.client(service_name='comprehend', region_name='us-east-1')
+reko = boto3.client("rekognition")
+
+
+# ## 2. Generating Classifications from the Annotations
+
+
+# In[2]:
+
+
+class BoundingBox(object):
+    def __init__(self, x, y, width, height):
+        print("init in Bounding box")
+        self.x = x
+        self.y = y
+        self.width = width
+        self.height = height
+    def __repr__(self):
+        return str(self.__dict__)
+    
+class Token(object):
+    def __init__(self, TokenId, Text, BeginOffset, EndOffset, Tag, Score):
+        print("init in Token")
+        assert Score > 0.9, 'Not enough confidence on tag'
+        self.TokenId = TokenId
+        self.Text = Text
+        self.LowerText = Text.lower()
+        self.BeginOffset = BeginOffset
+        self.EndOffset = EndOffset
+        self.Tag = Tag
+        self.Score = Score
+    def __repr__(self):
+        return str(self.__dict__)
+
+        
+class ImageAnnotation(object):
+    COLORS = {'blue', 'red', 'yellow', 'green', 'white', 'silver', 'gray', 'grey', 'orange', 'black', 'brown', 'pink', 'purple', 'while'}
+    STOPWORDS = {'elevens', 'fivr', 'plie', 'thirteens', 'pile', 'piles'}
+    
+    def __init__(self, index, bounding_box, phrase, comprehend=None):
+        print("init in imageAnnotation")
+        self.bb = bounding_box
+        self.index = index
+        self.phrase = phrase
+        if (comprehend):
+            self.update_tokens(comprehend)
+        else:
+            self.Tokens = None
+            self.obj_class = None
+        
+    def _gen_tokens(self, comprehend):
+        return(comprehend.detect_syntax(LanguageCode='en', Text=self.phrase)['SyntaxTokens'])
+    
+    def update_tokens(self, comprehend):
+        self.Tokens = self._gen_tokens(comprehend) if len(self.phrase) else None
+        if self.Tokens and len(self.Tokens):
+            self.obj_class = self.get_class()
+        else:
+            self.obj_class = None
+        
+    def get_class(self):
+        assert self.Tokens, "No tokenization available for class extraction"
+        def get_object(tokens):
+            noun_part = []
+            for token in tokens:
+                if token['PartOfSpeech']['Tag'] == 'VERB':
+                    break
+                if token['Text'].lower() in ImageAnnotation.COLORS:
+                    continue
+                if token['Text'].lower() in ImageAnnotation.STOPWORDS:
+                    continue
+                if token['PartOfSpeech']['Tag'] in ('ADJ', 'NOUN', 'PROPN'):
+                    noun_part.append(token)
+            return ' '.join([x['Text'] for x in noun_part])
+        result = get_object(self.Tokens)
+        if len(result) > 0:
+            result = result[:-1] if result[-1] == 's' else result
+        return(result)
+        
+    def __repr__(self):
+        return str(self.__dict__)
+
+
+class Image(object):
+    def __init__(self, path, filename, size, annotations):
+        print("init in image")
+        self.path = path
+        self.filename = filename
+        self.size = size
+        self.annotations = annotations
+        im = Imagem.open(f"{self.path}/{self.filename}")
+        self.width, self.height = im.size
+        self.classify_image()
+        
+    def classify_image(self):
+        self.obj_classes = {annotation.obj_class for annotation in self.annotations if annotation.obj_class}
+    
+    def gen_tokens(self, comprehend):
+        for annot in self.annotations:
+            annot.update_tokens(comprehend)
+            
+    def __repr__(self):
+        return str(self.__dict__)
+
+
+# ### Helper Function to process the manifest
+
+# In[3]:
+
+
+def load_images(path, manifest_file, comprehend=None):
+    print("loading images")
+    with open(manifest_file, "r") as source_manifest:
+        manifest = json.load(source_manifest)
+    images = []
+    for _, image in manifest.items():
+        try:
+            try:
+                annotations = []
+                for (index, annotation) in image['regions'].items():
+                    shape_attrs = annotation['shape_attributes']
+                    shape_attrs.pop('name')
+                    phrase = annotation['region_attributes']['phrase']
+                    img = ImageAnnotation(index, BoundingBox(**shape_attrs), phrase, comprehend)
+                    if img.obj_class and len(img.obj_class):
+                        annotations.append(img)
+            except:
+                pprint(annotation['shape_attributes'])
+                raise
+            images.append(
+                Image(path, image['filename'], image['size'], annotations)
+            )
+        except:
+            pprint(image)
+            raise
+    return(images)
+
+
+# In[4]:
+
+
+image_objs = load_images("/content/drive/MyDrive/data/UAVdata", "/content/drive/MyDrive/data/via_region_data_final.json", comprehend)
+[image.classify_image() for image in image_objs]
+
+
+# ## 3. Train/Test Split
+
+
+# In[12]:
+
+
+def split_data(image_objs, pct_train=0.8, random_state=None):
+    print("splitting data")
+    classified_images = [image for image in image_objs if len(image.obj_classes) > 0]
+    unclassified_images = [image for image in image_objs if len(image.obj_classes) == 0]
+    train_images, test_images = train_test_split(classified_images, train_size=pct_train, random_state=random_state)
+    print("done splitting")
+    return(train_images, test_images, unclassified_images)
+
+
+# In[342]:
+
+
+num_examples=1000
+train_data, test_data_full, unclassified = split_data(image_objs , pct_train=0.8)
+test_data = test_data_full[:num_examples]
+unused_data = test_data_full[num_examples:]
+
+
+# In[343]:
+
+
+print(len(train_data))
+print(len(test_data))
+
+
+# ## Preparing the Ground Truth Manifest
+
+
+# In[256]:
+
+
+from collections import Counter
+
+class_map = {classif: i+1 for (i, (classif, _)) in
+             enumerate(
+                 Counter(
+                     [an.obj_class for image in train_data for an in image.annotations if an.obj_class and len(an.obj_class)]
+                 ).most_common(34)
+             )}
+
+
+# In[329]:
+
+
+def gen_manifest(image, class_map, s3_path, job_number=0, max_annotations=None, indent=None):
+    print("In gen_manifest")
+    img_annotations = image.annotations if max_annotations is None else image.annotations[:max_annotations]
+    class_map['others'] = 0
+
+    classes_in_img = {an.obj_class for an in img_annotations}
+    if len(classes_in_img.difference(class_map.keys())):
+        classes_in_img.add('others')
+    annotations = [{
+        "class_id": class_map.get(an.obj_class, 0),
+        "left": an.bb.x,
+        "top": an.bb.y,
+        "width": an.bb.width,
+        "height": an.bb.height
+    } for an in img_annotations]
+    
+    manifest = {
+        "source-ref": f'{s3_path}/{image.filename}',
+        "bounding-box": { 
+            "image_size": [
+                {
+                    "width": image.width,
+                    "height": image.height,
+                    "depth": 3 
+                }
+            ],
+            "annotations": annotations
+        },
+        "bounding-box-metadata": { 
+            "objects": [ {"confidence": 0.9} for _ in img_annotations ],
+            "class-map": {v: k for k, v in class_map.items() if k in classes_in_img},
+            "type": "groundtruth/object-detection",
+            "human-annotated": "yes",
+            "creation-date": "2020-02-25T22:50:05.0000z",
+            "job-name": f"identify-construction-objs-{job_number}"
+        }
+     }
+    return(json.dumps(manifest, indent=indent))
+
+def save_manifest(data, path, job_number=0, max_annotations=5):
+    print("saving manifest")
+    s3_path = f"s3://{bucket}/{input_path}"
+    with open(path, 'w') as outfile:
+        for example in data:
+            outfile.write(f"{gen_manifest(example, class_map, s3_path, max_annotations=max_annotations, job_number=job_number)}\n")
+
+
+# The `manifest_version` variable control the names of the datasets, and the project version name. It is formed by an incremental version number and the number of examples generated.
+
+# In[344]:
+
+
+job_number = 4
+manifest_version = f"{num_examples}_v{job_number}"
+
+
+# In[345]:
+
+
+save_manifest(train_data, f'data/train_{manifest_version}.manifest', job_number=job_number)
+save_manifest(test_data, f'data/test_{manifest_version}.manifest', job_number=job_number)
+
+
+# ### Validating Manifest File
+
+# In[131]:
+
+
+
+# In[142]:
+
+
+import logging
+import jsonlines
+from jsonlines.jsonlines import InvalidLineError
+import fastjsonschema
+
+LOGGER = logging.getLogger(__name__)
+
+
+class GroundTruthManifestStatistics:
+    """
+    Manifest statistics
+    """
+    def __init__(self):
+        print("ground truth manifest statistics")
+        self.total_line_count = 0
+        self.source_ref_only_line_count = 0
+        self.valid_line_count = 0
+        self.valid_annotations = 0
+        self.invalid_annotations = 0
+
+    def __add__(self, stats):
+        self.total_line_count += stats.total_line_count
+        self.source_ref_only_line_count += stats.source_ref_only_line_count
+        self.valid_line_count += stats.valid_line_count
+        self.valid_annotations += stats.valid_annotations
+        self.invalid_annotations += stats.invalid_annotations
+        return self
+
+    def get_total_line_without_source_ref_only_line(self):
+        # do not include line with image but no annotation in total
+        return self.total_line_count - self.source_ref_only_line_count
+
+    def __eq__(self, stats):
+        try:
+            return self.total_line_count == stats.total_line_count                 and self.source_ref_only_line_count == self.source_ref_only_line_count                 and self.valid_line_count == stats.valid_line_count                 and self.valid_annotations == stats.valid_annotations                 and self.invalid_annotations == stats.invalid_annotations
+        except AttributeError:
+            return False
+
+    def __str__(self):
+        return "total line:{0}, source_ref_only:{1}, valid_line:{2}, valid_annotations:{3}, invalid_annotations:{4}"            .format(self.total_line_count, self.source_ref_only_line_count, self.valid_line_count,
+                    self.valid_annotations, self.invalid_annotations)
+
+
+class GroundTruthManifestValidator:
+    """
+    Manifest validation class
+    """
+
+    def __init__(self):
+        print("ground truth manifest validator")
+        self.source_validator = fastjsonschema.compile(Schemas.SOURCE_SCHEMA)
+        self.metadata_validator = fastjsonschema.compile(Schemas.METADATA_SCHEMA)
+        self.attribute_validator = fastjsonschema.compile(Schemas.ATTRIBUTE_SCHEMA)
+
+    def _transform_attribute_and_metadata(self, attribute, metadata):
+        """Extract necessary fields
+        Currently we only retain fields which can fit into OpenImage format used by science training code
+
+        :param attribute: attribute info
+        :param metadata: metadata info
+        :return: validated label
+        """
+        print("transform attribute and metadata")
+
+        valid_label = {}
+        if LABEL_TYPE_CLASSIFICATION in metadata[METADATA_TYPE]:
+            # classification
+            valid_label[METADATA_CLASS_NAME] = metadata[METADATA_CLASS_NAME]
+            valid_label[METADATA_CONFIDENCE] = metadata[METADATA_CONFIDENCE]
+            valid_label[METADATA_HUMAN_ANNOTATED] = metadata[METADATA_HUMAN_ANNOTATED]
+            valid_label[METADATA_CREATION_DATE] = metadata[METADATA_CREATION_DATE]
+            valid_label[ANNOTATION_TYPE] = LABEL_TYPE_CLASSIFICATION
+        else:
+            # detection
+            valid_label[METADATA_HUMAN_ANNOTATED] = metadata[METADATA_HUMAN_ANNOTATED]
+            valid_label[METADATA_OBJECTS] = metadata[METADATA_OBJECTS]
+            valid_label[METADATA_CLASS_MAP] = metadata[METADATA_CLASS_MAP]
+            valid_label[ATTRIBUTE_ANNOTATIONS] = attribute[ATTRIBUTE_ANNOTATIONS]
+            valid_label[ATTRIBUTE_IMAGE_SIZE] = attribute[ATTRIBUTE_IMAGE_SIZE]
+            valid_label[METADATA_CREATION_DATE] = metadata[METADATA_CREATION_DATE]
+            valid_label[ANNOTATION_TYPE] = LABEL_TYPE_DETECTION
+
+        return valid_label
+
+    def _perform_deep_annotation_check(self, attribute, metadata, current_manifest_stats, line_number):
+        """Perform deep checks across attribute and its metadata
+
+        :param annotation: annotation
+        :return: annotation if valid, None if invalid
+        """
+        print("perform deep annotation check")
+        annotation = self._transform_attribute_and_metadata(attribute, metadata)
+        if LABEL_TYPE_DETECTION in annotation[ANNOTATION_TYPE]:
+            # Validate if every bounding box label has a confidence
+            if len(annotation[ATTRIBUTE_ANNOTATIONS]) != len(annotation[METADATA_OBJECTS]):
+                current_manifest_stats.invalid_annotations += 1
+                LOGGER.info("line %s: Ground truth annotation does not contain valid confidence objects", line_number)
+                print(f"line {line_number}: Ground truth annotation does not contain valid confidence objects" )
+                return None
+
+            # Validate if bounding box class_id exists in the class map
+            for bounding_box in annotation[ATTRIBUTE_ANNOTATIONS]:
+                if str(bounding_box[METADATA_CLASS_ID]) not in annotation[METADATA_CLASS_MAP]:
+                    current_manifest_stats.invalid_annotations += 1
+                    LOGGER.info("line %s: Ground truth annotation does not contain valid class_id: %s",
+                                line_number, str(bounding_box[METADATA_CLASS_ID]))
+                    print(f"line {line_number}: Ground truth annotation does not contain valid class_id: {str(bounding_box[METADATA_CLASS_ID])}")
+                    print(f"BB Metadata: {str(bounding_box[METADATA_CLASS_ID])}\n Annotation: {annotation[METADATA_CLASS_MAP]}")
+                    return None
+
+        return annotation
+
+
+# In[346]:
+
+
+stats = GroundTruthManifestStatistics()
+validator = GroundTruthManifestValidator()
+manif, stats2 = validator.validate_manifest(open(f'data/train_{manifest_version}.manifest', 'r'), stats)
+print(stats2)
+print('--------------------------------------------------------------------------------------')
+manif, stats2 = validator.validate_manifest(open(f'data/test_{manifest_version}.manifest', 'r'), stats)
+print(stats2)
+
+
+# ### Saving Manifest in S3
+
+
+# In[347]:
+
+
+s3.upload_file(f'data/train_{manifest_version}.manifest', reko_bucket, f"datasets/{reko_manifest_path}-{manifest_version}-train/manifests/output/output.manifest")
+s3.upload_file(f'data/test_{manifest_version}.manifest', reko_bucket, f"datasets/{reko_manifest_path}-{manifest_version}-test/manifests/output/output.manifest")
+print(f"Train Manifest name: s3://{reko_bucket}/datasets/{reko_manifest_path}-{manifest_version}-train/manifests/output/output.manifest")
+print(f"Test Manifest name: s3://{reko_bucket}/datasets/{reko_manifest_path}-{manifest_version}-test/manifests/output/output.manifest")
+
+
+# ## Creating and Training the Model on Rekognition
+
+
+# In[351]:
+
+
+get_ipython().system('aws rekognition describe-projects')
+
+
+# In[352]:
+
+
+def get_project(project_name="construction-object-recognition-v3"):
+    project = 'arn:aws:rekognition:us-east-1:592627009550:project/construction-object-recognition-v3/1651662603706'
+    return(project)
+
+
+# In[353]:
+
+
+project = get_project()
+
+
+# In[354]:
+
+
+#version_number = 3
+print(project)
+version_number = len(reko.describe_project_versions(ProjectArn=project)['ProjectVersionDescriptions']) + 1
+version_name = f"constr-obj-rek-{manifest_version}-v{version_number}"
+print(version_name)
+
+
+# In[355]:
+
+
+TrainingData = {
+  "Assets": [ 
+     { 
+        "GroundTruthManifest": { 
+           "S3Object": { 
+              "Bucket": reko_bucket,
+              "Name": f"datasets/{reko_manifest_path}-{manifest_version}-train/manifests/output/output.manifest"
+           }
+        }
+     }
+  ]
+}
+TestingData = { 
+    "Assets": [ 
+        { 
+           "GroundTruthManifest": { 
+               "S3Object": { 
+                   "Bucket": reko_bucket,
+                   "Name": f"datasets/{reko_manifest_path}-{manifest_version}-test/manifests/output/output.manifest"
+               }
+           }
+        }
+    ],
+    "AutoCreate": False
+}
+OutputConfig = { 
+  "S3Bucket": bucket,
+  "S3KeyPrefix": output_path
+}
+print(f"Creating version {manifest_version}-v{version_number} for project {project}")
+
+
+# The next two cells are purely informative, to confirm that the parameters are correctly generated.
+
+# In[356]:
+
+
+TrainingData, TestingData
+
+
+# In[357]:
+
+
+[x for x in reko.describe_project_versions(ProjectArn=project)['ProjectVersionDescriptions'] if x['Status'] != 'TRAINING_FAILED']
+
+
+
+# In[359]:
+
+
+prj_version_arn = reko.create_project_version(ProjectArn=project, VersionName=version_name,
+      OutputConfig=OutputConfig, TrainingData=TrainingData, TestingData=TestingData)['ProjectVersionArn']
+print("prj_version_arn is "+str(prj_version_arn))
+
+
+# ## Executing inference
+
+# ### Helper Functions for Model Start, Stop and Inference
+
+# In[296]:
+
+
+def start_model(project_arn, model_arn, version_name, min_inference_units, client):
+
+    try:
+        # Start the model
+        print('Starting model: ' + model_arn)
+        print("model_arn"+str(model_arn)+"min inference units"+str(min_inference_units))
+        response=client.start_project_version(ProjectVersionArn=model_arn, MinInferenceUnits=min_inference_units)
+        # Wait for the model to be in the running state
+        project_version_running_waiter = client.get_waiter('project_version_running')
+        project_version_running_waiter.wait(ProjectArn=project_arn, VersionNames=[version_name])
+
+        #Get the running status
+        describe_response=client.describe_project_versions(ProjectArn=project_arn,
+            VersionNames=[version_name])
+        for model in describe_response['ProjectVersionDescriptions']:
+            print("Status: " + model['Status'])
+            print("Message: " + model['StatusMessage']) 
+    except Exception as e:
+        print(e)
+        
+    print('Done...')
+    
+def stop_model(model_arn, client):
+
+    print('Stopping model:' + model_arn)
+
+    #Stop the model
+    try:
+        response=client.stop_project_version(ProjectVersionArn=model_arn)
+        status=response['Status']
+        print ('Status: ' + status)
+    except Exception as e:  
+        print(e)  
+
+    print('Done...')
+
+
+
+
+# In[243]:
+
+
+import io
+from PIL import ImageDraw, ExifTags, ImageColor, ImageFont
+
+def show_custom_labels(model,bucket,photo, min_confidence, client):
+    # Load image from S3 bucket
+    s3_connection = boto3.resource('s3')
+
+    s3_object = s3_connection.Object(bucket,photo)
+    s3_response = s3_object.get()
+
+    stream = io.BytesIO(s3_response['Body'].read())
+    image=Imagem.open(stream)
+    
+    
+    
+    #Call DetectCustomLabels 
+    response = client.detect_custom_labels(Image={'S3Object': {'Bucket': bucket, 'Name': photo}},
+        MinConfidence=min_confidence,
+        ProjectVersionArn=model)
+   
+   
+    imgWidth, imgHeight = image.size  
+    draw = ImageDraw.Draw(image)  
+
+       
+    # calculate and display bounding boxes for each detected custom label       
+    #print('Detected custom labels for ' + photo)    
+    for customLabel in response['CustomLabels']:
+        #print('Label ' + str(customLabel['Name'])) 
+        #print('Confidence ' + str(customLabel['Confidence'])) 
+        if 'Geometry' in customLabel:
+            if customLabel['Confidence'] > 67:
+                fill_color = '#00d400'
+            elif customLabel['Confidence'] > 33:
+                fill_color = '#f0d802'
+            else:
+                fill_color = '#ed1000'
+            box = customLabel['Geometry']['BoundingBox']
+            left = imgWidth * box['Left']
+            top = imgHeight * box['Top']
+            width = imgWidth * box['Width']
+            height = imgHeight * box['Height']
+            draw.text((left,top), customLabel['Name'], fill='white') 
+            #print('Left: ' + '{0:.0f}'.format(left))
+            #print('Top: ' + '{0:.0f}'.format(top))
+            #print('Face Width: ' + "{0:.0f}".format(width))
+            #print('Face Height: ' + "{0:.0f}".format(height))
+
+            points = (
+                (left,top),
+                (left + width, top),
+                (left + width, top + height),
+                (left , top + height),
+                (left, top))
+            draw.line(points, fill=fill_color, width=5)
+
+    return({label['Name'] for label in response['CustomLabels']}, response['CustomLabels'], image)
+
+
+# ### Starting the model for Inference
+
+
+
+# In[212]:
+
+
+start_model(project_arn=project, 
+            model_arn=prj_version_arn,
+            version_name=version_name,
+            min_inference_units=1, 
+            client=reko
+           )
+
+
+# In[244]:
+
+
+labels, response, image = show_custom_labels(
+    model=prj_version_arn,
+    bucket=bucket, 
+    photo=f'cl-demo/input/{test_data[0].filename}',
+    min_confidence=40,
+    client=reko
+)
+
+
+# In[245]:
+
+
+image
+
+
+# In[297]:
+
+
+stop_model(model_arn=prj_version_arn, client=reko)
+
